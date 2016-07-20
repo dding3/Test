@@ -216,12 +216,14 @@ object GD extends Logging {
     var i = 1
 
     val jobQueue = new Queue[FutureAction[Unit]]()
+    val bcQueue = new Queue[Broadcast[Vector]]()
     var currentJob: FutureAction[Unit] = None.asInstanceOf[FutureAction[Unit]]
     var previousRdd : RDD[BDV[Double]] = None.asInstanceOf[RDD[BDV[Double]]]
     var currentRdd : RDD[BDV[Double]] = None.asInstanceOf[RDD[BDV[Double]]]
 
     while (i <= numIterations) {
       val bcWeights = data.context.broadcast(Vectors.fromBreeze(acc.value))
+      bcQueue.enqueue(bcWeights)
 
       while(i<= numIterations && jobQueue.size <= statelessIteration) {
         if(i == 1) {
@@ -236,9 +238,11 @@ object GD extends Logging {
         } else {
           currentRdd = data.zipPartitions(previousRdd) { (points, rddIter) =>
             val gradientPerPartition = BDV.zeros[Double](n)
-            //TODO: need compute a local weights based on rddIter
+            val g = rddIter.next()
+            val localWeights = Vectors.fromBreeze(bcWeights.value.toBreeze + (g/numExamples.toDouble)*(-stepSize/math.sqrt(i)))
+
             points.foreach { point =>
-              gradient.compute(point._2, point. _1, bcWeights.value,
+              gradient.compute(point._2, point. _1, localWeights,
                 Vectors.fromBreeze(gradientPerPartition))
             }
             Iterator(gradientPerPartition)
@@ -252,7 +256,9 @@ object GD extends Logging {
       if(jobQueue.size > statelessIteration) {
         Await.result(jobQueue.dequeue(), Duration.Inf)
       }
-      SparkEnv.get.blockManager.removeBroadcast(bcWeights.id, true)
+      if(bcQueue.size > 2) { //only need to keep latest 2 broadcast
+        SparkEnv.get.blockManager.removeBroadcast(bcQueue.dequeue.id, true)
+      }
     }
 
     while(jobQueue.isEmpty) {
