@@ -20,10 +20,14 @@ package org.apache.spark.mllib.optimization
 import scala.collection.mutable.ArrayBuffer
 import breeze.linalg.{norm, DenseVector => BDV}
 import org.apache.spark.annotation.{DeveloperApi, Experimental}
-import org.apache.spark.{Accumulable, AccumulatorParam, Logging}
+import org.apache.spark._
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
 import org.apache.spark.mllib.linalg.{DenseVector, Vector, Vectors}
-import org.apache.spark.Accumulator
+
+import scala.collection.mutable.Queue
+import scala.concurrent.Await
+import scala.concurrent.duration.Duration
 
 /**
   * Class used to solve an optimization problem using Gradient Descent.
@@ -211,39 +215,49 @@ object GD extends Logging {
     val acc = data.context.accumulator(new BDV[Double](initialWeights.toArray.clone()))(VectorAccumulatorParam)
     var i = 1
 
-
-
-
+    val jobQueue = new Queue[FutureAction[Unit]]()
+    var currentJob: FutureAction[Unit] = None.asInstanceOf[FutureAction[Unit]]
+    var previousRdd : RDD[BDV[Double]] = None.asInstanceOf[RDD[BDV[Double]]]
+    var currentRdd : RDD[BDV[Double]] = None.asInstanceOf[RDD[BDV[Double]]]
 
     while (i <= numIterations) {
       val bcWeights = data.context.broadcast(Vectors.fromBreeze(acc.value))
 
-      var previousRdd : Option[RDD[BDV[Double]]] = None
-      var currentRdd : Option[RDD[BDV[Double]]] = None
-      if(i == 0) {
-        val rdd1 = data.mapPartitions { points =>
-          val gradientPerPartition = BDV.zeros[Double](n)
-          var size = 0
-          points.foreach { point =>
-            gradient.compute(point._2, point. _1, bcWeights.value,
-              Vectors.fromBreeze(gradientPerPartition))
+      while(i<= numIterations && jobQueue.size <= statelessIteration) {
+        if(i == 1) {
+          currentRdd = data.mapPartitions { points =>
+            val gradientPerPartition = BDV.zeros[Double](n)
+            points.foreach { point =>
+              gradient.compute(point._2, point._1, bcWeights.value,
+                Vectors.fromBreeze(gradientPerPartition))
+            }
+            Iterator(gradientPerPartition)
           }
-          Iterator(gradientPerPartition)
+        } else {
+          currentRdd = data.zipPartitions(previousRdd) { (points, rddIter) =>
+            val gradientPerPartition = BDV.zeros[Double](n)
+            //TODO: need compute a local weights based on rddIter
+            points.foreach { point =>
+              gradient.compute(point._2, point. _1, bcWeights.value,
+                Vectors.fromBreeze(gradientPerPartition))
+            }
+            Iterator(gradientPerPartition)
+          }
         }
-        rdd1.foreachAsync{x => acc += ((x/numExamples.toDouble)*(-stepSize/math.sqrt(i)))}
-      } else {
-        val rdd2 = data.zipPartitions(rdd1) {
-
-        }
+        currentJob = currentRdd.foreachAsync{x => acc += ((x/numExamples.toDouble)*(-stepSize/math.sqrt(i)))}
+        jobQueue.enqueue(currentJob)
+        previousRdd = currentRdd
+        i += 1
       }
-
-      i += 1
+      if(jobQueue.size > statelessIteration) {
+        Await.result(jobQueue.dequeue(), Duration.Inf)
+      }
+      SparkEnv.get.blockManager.removeBroadcast(bcWeights.id, true)
     }
 
-
-
-
-
+    while(jobQueue.isEmpty) {
+      Await.result(jobQueue.dequeue(), Duration.Inf)
+    }
 
     logInfo("GradientDescent.runMiniBatchSGD finished. Last 10 stochastic losses %s".format(
       stochasticLossHistory.takeRight(10).mkString(", ")))
