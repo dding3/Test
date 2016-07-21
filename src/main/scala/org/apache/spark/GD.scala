@@ -215,17 +215,16 @@ object GD extends Logging {
     val acc = data.context.accumulator(new BDV[Double](initialWeights.toArray.clone()))(VectorAccumulatorParam)
     var i = 1
 
-    val jobQueue = new Queue[FutureAction[Unit]]()
+    val queue = new Queue[(FutureAction[Unit], RDD[BDV[Double]])]()
     val bcQueue = new Queue[Broadcast[Vector]]()
-    var currentJob: FutureAction[Unit] = None.asInstanceOf[FutureAction[Unit]]
-    var previousRdd : RDD[BDV[Double]] = None.asInstanceOf[RDD[BDV[Double]]]
-    var currentRdd : RDD[BDV[Double]] = None.asInstanceOf[RDD[BDV[Double]]]
+    var previousRdd : RDD[BDV[Double]] = null
+    var currentRdd : RDD[BDV[Double]] = null
 
     while (i <= numIterations) {
       val bcWeights = data.context.broadcast(Vectors.fromBreeze(acc.value))
       bcQueue.enqueue(bcWeights)
 
-      while(i<= numIterations && jobQueue.size <= statelessIteration) {
+      while(i<= numIterations && queue.size <= statelessIteration) {
         if(i == 1) {
           currentRdd = data.mapPartitions { points =>
             val gradientPerPartition = BDV.zeros[Double](n)
@@ -234,7 +233,7 @@ object GD extends Logging {
                 Vectors.fromBreeze(gradientPerPartition))
             }
             Iterator(gradientPerPartition)
-          }
+          }.cache()
         } else {
           currentRdd = data.zipPartitions(previousRdd) { (points, rddIter) =>
             val gradientPerPartition = BDV.zeros[Double](n)
@@ -246,23 +245,27 @@ object GD extends Logging {
                 Vectors.fromBreeze(gradientPerPartition))
             }
             Iterator(gradientPerPartition)
-          }
+          }.cache()
         }
-        currentJob = currentRdd.foreachAsync{x => acc += ((x/numExamples.toDouble)*(-stepSize/math.sqrt(i)))}
-        jobQueue.enqueue(currentJob)
+        val job = currentRdd.foreachAsync{x => acc += ((x/numExamples.toDouble)*(-stepSize/math.sqrt(i)))}
+        queue.enqueue((job, currentRdd))
         previousRdd = currentRdd
         i += 1
       }
-      if(jobQueue.size > statelessIteration) {
-        Await.result(jobQueue.dequeue(), Duration.Inf)
+      if(queue.size > statelessIteration) {
+        val (job, rdd) = queue.dequeue()
+        Await.result(job, Duration.Inf)
+        rdd.unpersist()
       }
-      if(bcQueue.size > 2) { //only need to keep latest 2 broadcast
-        SparkEnv.get.blockManager.removeBroadcast(bcQueue.dequeue.id, true)
-      }
+//      if(bcQueue.size > 2) { //only need to keep latest 2 broadcast
+//        SparkEnv.get.blockManager.removeBroadcast(bcQueue.dequeue.id, true)
+//      }
     }
 
-    while(jobQueue.isEmpty) {
-      Await.result(jobQueue.dequeue(), Duration.Inf)
+    while(!queue.isEmpty) {
+      val (job, rdd) = queue.dequeue()
+      Await.result(job, Duration.Inf)
+      rdd.unpersist()
     }
 
     logInfo("GradientDescent.runMiniBatchSGD finished. Last 10 stochastic losses %s".format(
