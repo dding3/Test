@@ -235,7 +235,7 @@ object GD extends Logging {
             Iterator(gradientPerPartition)
           }.cache()
         } else {
-          currentRdd = data.zipPartitions(previousRdd) { (points, rddIter) =>
+          currentRdd = data.zipPartitionsWithSSPDependency(previousRdd) { (points, rddIter) =>
             val gradientPerPartition = BDV.zeros[Double](n)
             val g = rddIter.next()
             val localWeights = Vectors.fromBreeze(bcWeights.value.toBreeze + (g/numExamples.toDouble)*(-stepSize/math.sqrt(i)))
@@ -248,14 +248,17 @@ object GD extends Logging {
           }.cache()
         }
         val job = currentRdd.foreachAsync{x => acc += ((x/numExamples.toDouble)*(-stepSize/math.sqrt(i)))}
-        queue.enqueue((job, currentRdd))
+        queue.enqueue((job, previousRdd))
         previousRdd = currentRdd
         i += 1
       }
       if(queue.size > statelessIteration) {
         val (job, rdd) = queue.dequeue()
+        println("wait for job: " + job.jobIds +"Finished")
         Await.result(job, Duration.Inf)
-        rdd.unpersist()
+        if(rdd != null) {
+          rdd.unpersist()
+        }
       }
 //      if(bcQueue.size > 2) { //only need to keep latest 2 broadcast
 //        SparkEnv.get.blockManager.removeBroadcast(bcQueue.dequeue.id, true)
